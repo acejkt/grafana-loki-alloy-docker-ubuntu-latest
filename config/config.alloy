@@ -1,0 +1,84 @@
+logging {
+  level  = "info"
+  format = "logfmt"
+  write_to = [loki.relabel.alloy_logs.receiver]
+}
+
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+  filter {
+    name   = "status"
+    values = ["running"]
+  }
+}
+
+local.file_match "host_logs" {
+  path_targets = [
+    { __path__ = "/var/log/syslog", job = "system-syslog" },
+    { __path__ = "/var/log/auth.log", job = "auth-logs" },
+    { __path__ = "/var/log/kern.log", job = "kernel-logs" },
+    { __path__ = "/var/log/dpkg.log", job = "package-logs" },
+    { __path__ = "/var/log/apt/history.log", job = "apt-logs" },
+  ]
+}
+
+loki.source.file "host_tail" {
+  targets       = local.file_match.host_logs.targets
+  forward_to    = [loki.process.host_pipeline.receiver]
+  tail_from_end = true
+}
+
+loki.process "host_pipeline" {
+  forward_to = [loki.write.local_loki.receiver]
+  stage.static_labels {
+    values = {
+      collector = "alloy",
+      platform  = "ubuntu-vm",
+      vm_type   = "vmware-workstation",
+    }
+  }
+}
+
+loki.source.docker "container_logs" {
+  host       = "unix:///var/run/docker.sock"
+  targets    = discovery.docker.containers.targets
+  forward_to = [loki.process.docker_pipeline.receiver]
+  labels = {
+    job = "docker",
+  }
+}
+
+loki.process "docker_pipeline" {
+  forward_to = [loki.write.local_loki.receiver]
+  stage.cri {}
+  stage.static_labels {
+    values = {
+      source = "docker-engine",
+    }
+  }
+}
+
+loki.relabel "alloy_logs" {
+  forward_to = [loki.write.local_loki.receiver]
+  rule {
+    target_label = "job"
+    replacement  = "alloy-internal"
+  }
+}
+
+loki.write "local_loki" {
+  endpoint {
+    name = "local-loki"
+    url  = "http://loki:3100/loki/api/v1/push"
+    headers = {
+      "X-Scope-OrgID" = "vmware-ubuntu",
+    }
+    batch_wait = "1s"
+    batch_size = "100KB"
+  }
+  external_labels = {
+    cluster = "vmware-workstation",
+    env     = "development",
+    os      = "ubuntu",
+  }
+}

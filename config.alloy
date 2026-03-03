@@ -1,0 +1,141 @@
+// ==========================================
+// Grafana Alloy Configuration (Modern)
+// Compatible with Alloy v1.2.0+
+// ==========================================
+
+// Alloy's own telemetry
+logging {
+  level    = "info"
+  format   = "logfmt"
+  write_to = [loki.relabel.alloy_logs.receiver]
+}
+
+prometheus.exporter.self "alloy" {}
+prometheus.scrape "alloy" {
+  targets    = prometheus.exporter.self.alloy.targets
+  forward_to = []
+  job_name   = "alloy"
+}
+
+// 1. DISCOVERY
+discovery.docker "containers" {
+  host = "unix:///var/run/docker.sock"
+  filter {
+    name   = "status"
+    values = ["running"]
+  }
+}
+
+discovery.relabel "docker_logs" {
+  targets = discovery.docker.containers.targets
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    target_label  = "container"
+    regex         = "/(.*)"
+    replacement   = "${1}"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_log_stream"]
+    target_label  = "stream"
+  }
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "compose_service"
+  }
+}
+
+// 2. HOST LOGS
+local.file_match "host_logs" {
+  path_targets = [
+    { __path__ = "/var/log/**/*.log", job = "host-logs" },
+    { __path__ = "/var/log/syslog", job = "system-syslog" },
+    { __path__ = "/var/log/auth.log", job = "auth-logs" },
+  ]
+}
+
+loki.source.file "host_tail" {
+  targets               = local.file_match.host_logs.targets
+  forward_to            = [loki.process.host_pipeline.receiver]
+  tail_from_end         = true
+  decompression_enabled = true
+}
+
+loki.process "host_pipeline" {
+  forward_to = [loki.write.local_loki.receiver]
+  stage.static_labels {
+    values = {
+      collector = "alloy",
+      platform  = "docker",
+    }
+  }
+  stage.timestamp {
+    source = "ts"
+    format = "RFC3339"
+  }
+}
+
+// 3. DOCKER LOGS (FIXED HERE)
+loki.source.docker "container_logs" {
+  host             = "unix:///var/run/docker.sock"
+  targets          = discovery.relabel.docker_logs.targets
+  forward_to       = [loki.process.docker_pipeline.receiver]
+  refresh_interval = "5s"
+  
+  labels = {
+    job = "docker",
+  }
+}
+
+loki.process "docker_pipeline" {
+  forward_to = [loki.write.local_loki.receiver]
+  stage.cri {}
+  stage.json {
+    source         = "log"
+    drop_malformed = true
+  }
+  stage.labels {
+    values = {
+      container = "container",
+      stream    = "stream",
+      service   = "compose_service",
+    }
+  }
+  stage.limit {
+    rate  = 1000
+    burst = 1500
+    drop  = true
+  }
+}
+
+// 4. ALLOY LOGS
+loki.relabel "alloy_logs" {
+  forward_to = [loki.write.local_loki.receiver]
+  rule {
+    target_label = "job"
+    replacement  = "alloy-internal"
+  }
+  rule {
+    target_label = "service_name"
+    replacement  = "alloy"
+  }
+}
+
+// 5. OUTPUT
+loki.write "local_loki" {
+  endpoint {
+    name = "local-loki"
+    url  = "http://loki:3100/loki/api/v1/push"
+    headers = {
+      "X-Scope-OrgID" = "docker-local",
+    }
+    batch_wait = "1s"
+    batch_size = "100KB"
+    min_backoff_period = "100ms"
+    max_backoff_period = "5s"
+    max_backoff_retries = 10
+  }
+  external_labels = {
+    cluster = "docker-desktop",
+    env     = "local",
+  }
+}
